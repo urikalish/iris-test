@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111827">
+  <title>Rear camera frame-rate test</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #111827; color: #f3f4f6; }
+    * { box-sizing: border-box; }
+    body { max-width: 960px; margin: auto; padding: 20px; }
+    h1 { font-size: clamp(1.4rem, 5vw, 2rem); margin: 0 0 12px; }
+    p { color: #cbd5e1; line-height: 1.5; }
+    button { padding: 12px 30px; border: 0; border-radius: 8px; background: #38bdf8; color: #082f49; font: inherit; font-weight: 700; cursor: pointer; }
+    button:focus-visible { outline: 3px solid white; outline-offset: 3px; }
+    #status { min-height: 1.5em; overflow-wrap: anywhere; }
+    #status.error { color: #fca5a5; }
+    #preview { position: relative; width: 100%; aspect-ratio: 4 / 3; background: #030712; overflow: hidden; border-radius: 12px; }
+    video { display: block; width: 100%; height: 100%; object-fit: contain; }
+    #target { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); outline: 2px solid #facc15; box-shadow: 0 0 0 3px #000; pointer-events: none; display: none; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-top: 16px; }
+    .stat { padding: 14px; border-radius: 8px; background: #1f2937; }
+    .label { display: block; font-size: .85rem; color: #cbd5e1; }
+    .value { display: block; font-size: 1.5rem; font-variant-numeric: tabular-nums; margin-top: 6px; }
+    #details { font-size: .9rem; overflow-wrap: anywhere; }
+    .notes { font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <h1>Rear camera frame-rate test</h1>
+  <p>Aim the yellow square at your subject. Brightness is analyzed locally; no images are uploaded or stored.</p>
+  <button id="toggle" type="button" aria-pressed="false">Start</button>
+  <p id="status" role="status" aria-live="polite">Ready. Camera access requires HTTPS (or localhost).</p>
+  <div id="preview">
+    <video id="video" autoplay muted playsinline></video>
+    <div id="target" aria-hidden="true"></div>
+  </div>
+  <div class="stats">
+    <div class="stat"><span class="label">Average processed FPS</span><output class="value" id="average">--</output></div>
+    <div class="stat"><span class="label">Minimum processed FPS</span><output class="value" id="minimum">--</output></div>
+    <div class="stat"><span class="label">Maximum processed FPS</span><output class="value" id="maximum">--</output></div>
+    <div class="stat"><span class="label">Latest processed FPS</span><output class="value" id="latest">--</output></div>
+    <div class="stat"><span class="label">Average brightness</span><output class="value" id="brightness">--</output></div>
+    <div class="stat"><span class="label">Frames analyzed</span><output class="value" id="frames">0</output></div>
+    <div class="stat"><span class="label">Mean analysis time</span><output class="value" id="analysis">--</output></div>
+    <div class="stat"><span class="label">Unanalyzed presented frames</span><output class="value" id="skipped">--</output></div>
+  </div>
+  <p id="details">No active camera.</p>
+  <p class="notes">
+    Requests up to 240 FPS initially, then the highest frame rate advertised by the camera.
+    A preferred 640 &times; 480 resolution reduces processing cost; the browser chooses the actual mode.
+    Camera settings are not measured throughput. Average FPS measures analyzed frames over elapsed time;
+    min/max/latest are completed roughly one-second sampling windows, including stalls.
+    The target is 12% of the shorter video dimension. Brightness is mean
+    Rec. 709 weighted RGB luma (0&ndash;255), not calibrated light intensity.
+    Keep the page visible and use good lighting: exposure, device temperature, browser scheduling,
+    and resolution can limit throughput. This measures browser-delivered frames, not the sensor's
+    theoretical maximum or necessarily the performance of a native Android application.
+    Video callbacks can also be limited by the display refresh rate.
+  </p>
+  <script>
+    "use strict";
+
+    const video = document.getElementById("video");
+    const preview = document.getElementById("preview");
+    const target = document.getElementById("target");
+    const toggle = document.getElementById("toggle");
+    const status = document.getElementById("status");
+    const details = document.getElementById("details");
+    const outputs = Object.fromEntries(
+      ["average", "minimum", "maximum", "latest", "brightness", "frames", "analysis", "skipped"]
+        .map(id => [id, document.getElementById(id)])
+    );
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    const hasVideoCallback = typeof video.requestVideoFrameCallback === "function";
+    let state = "idle";
+    let generation = 0;
+    let stream = null;
+    let callbackId = null;
+    let displayTimer = null;
+    let roi = null;
+    let stats = null;
+    let lastVideoTime = -1;
+    let lastPresented = null;
+
+    function setStatus(message, error = false) {
+      status.textContent = message;
+      status.classList.toggle("error", error);
+    }
+
+    function updateGeometry() {
+      if (state === "idle") return;
+      const width = video.videoWidth;
+      const height = video.videoHeight;
+      if (!width || !height) return;
+      const size = Math.max(1, Math.round(Math.min(width, height) * 0.12));
+      roi = { x: Math.floor((width - size) / 2), y: Math.floor((height - size) / 2), size };
+      if (canvas.width !== size || canvas.height !== size) {
+        canvas.width = size;
+        canvas.height = size;
+      }
+      preview.style.aspectRatio = `${width} / ${height}`;
+      const scale = Math.min(preview.clientWidth / width, preview.clientHeight / height);
+      target.style.width = `${size * scale}px`;
+      target.style.height = `${size * scale}px`;
+      target.style.display = "block";
+    }
+
+    function resetStats() {
+      stats = {
+        count: 0, first: null, windowStart: null, windowCount: 0,
+        minimum: Infinity, maximum: 0, latest: null, brightness: null,
+        analysisMs: 0, skipped: 0
+      };
+      lastVideoTime = -1;
+      lastPresented = null;
+      for (const output of Object.values(outputs)) output.textContent = "--";
+      outputs.frames.textContent = "0";
+    }
+
+    function renderStats() {
+      if (!stats) return;
+      const now = performance.now();
+      if (stats.windowStart !== null && now - stats.windowStart >= 1000) {
+        const fps = stats.windowCount * 1000 / (now - stats.windowStart);
+        stats.latest = fps;
+        stats.minimum = Math.min(stats.minimum, fps);
+        stats.maximum = Math.max(stats.maximum, fps);
+        stats.windowStart = now;
+        stats.windowCount = 0;
+      }
+      const elapsed = stats.first === null ? 0 : now - stats.first;
+      outputs.average.textContent = elapsed > 0 ? ((stats.count - 1) * 1000 / elapsed).toFixed(1) : "--";
+      outputs.minimum.textContent = Number.isFinite(stats.minimum) ? stats.minimum.toFixed(1) : "--";
+      outputs.maximum.textContent = stats.latest === null ? "--" : stats.maximum.toFixed(1);
+      outputs.latest.textContent = stats.latest === null ? "--" : stats.latest.toFixed(1);
+      outputs.brightness.textContent = stats.brightness === null ? "--" : `${stats.brightness.toFixed(1)} / 255`;
+      outputs.frames.textContent = String(stats.count);
+      outputs.analysis.textContent = stats.count ? `${(stats.analysisMs / stats.count).toFixed(2)} ms` : "--";
+      outputs.skipped.textContent = hasVideoCallback ? String(stats.skipped) : "Unavailable";
+    }
+
+    function stop(message = "Stopped. Results retained.", error = false) {
+      generation++;
+      state = "idle";
+      if (callbackId !== null) {
+        if (hasVideoCallback) video.cancelVideoFrameCallback(callbackId);
+        else cancelAnimationFrame(callbackId);
+        callbackId = null;
+      }
+      clearInterval(displayTimer);
+      displayTimer = null;
+      renderStats();
+      if (stream) {
+        for (const track of stream.getTracks()) {
+          track.onended = null;
+          track.stop();
+        }
+        stream = null;
+      }
+      video.pause();
+      video.srcObject = null;
+      target.style.display = "none";
+      roi = null;
+      toggle.textContent = "Start";
+      toggle.setAttribute("aria-pressed", "false");
+      setStatus(message, error);
+    }
+
+    function scheduleFrame(token) {
+      if (state !== "running" || token !== generation) return;
+      callbackId = hasVideoCallback
+        ? video.requestVideoFrameCallback((now, metadata) => processFrame(token, metadata))
+        : requestAnimationFrame(() => processFrame(token, null));
+    }
+
+    function processFrame(token, metadata) {
+      callbackId = null;
+      if (state !== "running" || token !== generation) return;
+      try {
+        // RAF is only a fallback: avoid analyzing the same video frame repeatedly.
+        const videoTime = metadata ? metadata.mediaTime : video.currentTime;
+        if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && videoTime !== lastVideoTime) {
+          if (!roi) updateGeometry();
+          if (roi) {
+            const started = performance.now();
+            context.drawImage(video, roi.x, roi.y, roi.size, roi.size, 0, 0, roi.size, roi.size);
+            const pixels = context.getImageData(0, 0, roi.size, roi.size).data;
+            let sum = 0;
+            for (let i = 0; i < pixels.length; i += 4) {
+              sum += 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2];
+            }
+            const finished = performance.now();
+            stats.brightness = sum / (pixels.length / 4);
+            stats.analysisMs += finished - started;
+            stats.count++;
+            if (stats.first === null) {
+              stats.first = finished;
+              stats.windowStart = finished;
+            } else {
+              stats.windowCount++;
+            }
+            if (metadata) {
+              if (lastPresented !== null) {
+                stats.skipped += Math.max(0, metadata.presentedFrames - lastPresented - 1);
+              }
+              lastPresented = metadata.presentedFrames;
+            }
+            lastVideoTime = videoTime;
+          }
+        }
+        scheduleFrame(token);
+      } catch (error) {
+        stop(`Frame analysis failed: ${error.message}`, true);
+      }
+    }
+
+    async function start() {
+      if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+        setStatus("Camera access is unavailable. Open this page over HTTPS (or localhost) in a camera-capable browser.", true);
+        return;
+      }
+      if (!context) {
+        setStatus("This browser cannot create a 2D canvas for brightness analysis.", true);
+        return;
+      }
+      const token = ++generation;
+      state = "starting";
+      resetStats();
+      toggle.textContent = "Stop";
+      toggle.setAttribute("aria-pressed", "true");
+      details.textContent = "Requesting rear camera...";
+      setStatus("Waiting for camera permission...");
+      try {
+        const acquired = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            facingMode: { exact: "environment" },
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            frameRate: { ideal: 240 }
+          }
+        });
+        if (token !== generation) {
+          acquired.getTracks().forEach(track => track.stop());
+          return;
+        }
+        stream = acquired;
+        const track = stream.getVideoTracks()[0];
+        track.onended = () => stop("The camera stream ended. Start again to reconnect.", true);
+        const capabilities = typeof track.getCapabilities === "function" ? track.getCapabilities() : {};
+        const advertisedMax = capabilities.frameRate?.max;
+        let constraintWarning = "";
+        if (Number.isFinite(advertisedMax) && advertisedMax > 0) {
+          try {
+            await track.applyConstraints({
+              width: { ideal: 640 }, height: { ideal: 480 },
+              frameRate: { ideal: advertisedMax }
+            });
+          } catch (error) {
+            constraintWarning = ` Highest-rate request failed (${error.name}: ${error.message}); using the acquired camera mode.`;
+          }
+        }
+        if (token !== generation) return;
+        video.srcObject = stream;
+        await video.play();
+        if (token !== generation) return;
+        updateGeometry();
+        const settings = track.getSettings();
+        details.textContent = `${track.label || "Rear camera"} | ${settings.width ?? "?"} x ${settings.height ?? "?"}` +
+          ` | Camera setting: ${settings.frameRate?.toFixed(1) ?? "unknown"} FPS` +
+          ` | Advertised maximum: ${advertisedMax ?? "unknown"} FPS` +
+          ` | ${hasVideoCallback ? "Video-frame callbacks" : "RAF fallback (may be display-rate limited)"}.`;
+        state = "running";
+        setStatus(`Running. Brightness and FPS update four times per second.${constraintWarning}`);
+        displayTimer = setInterval(renderStats, 250);
+        scheduleFrame(token);
+      } catch (error) {
+        if (token !== generation) return;
+        const hint = error.name === "OverconstrainedError"
+          ? " A rear-facing camera is required."
+          : error.name === "NotAllowedError"
+            ? " Allow camera permission in your browser settings."
+            : "";
+        stop(`Could not start camera: ${error.name}: ${error.message}.${hint}`, true);
+      }
+    }
+
+    toggle.addEventListener("click", () => state === "idle" ? start() : stop());
+    video.addEventListener("resize", updateGeometry);
+    window.addEventListener("resize", updateGeometry);
+    window.addEventListener("pagehide", () => {
+      if (state !== "idle") stop("Stopped when leaving the page.");
+    });
+  </script>
+</body>
+</html>
